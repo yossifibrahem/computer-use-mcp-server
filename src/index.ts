@@ -277,8 +277,12 @@ Note: Files with non-UTF-8 encoding will display hex escapes (e.g. \\x84) for in
       return { content: [{ type: "text" as const, text: "" }] };
     }
 
+    // Normalize CRLF before splitting so the LLM sees clean lines in view
+    // output and can reliably reconstruct old_str without stray \r characters.
+    const normalized = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
     // Split into lines (preserve trailing newline as an empty final line)
-    const lines = raw.split("\n");
+    const lines = normalized.split("\n");
     const totalLines = lines.length;
 
     // Handle view_range
@@ -486,8 +490,13 @@ server.registerTool(
 
     const content = fs.readFileSync(filePath, "utf8");
 
+    // Normalize CRLF so matching is consistent with what view displays.
+    const normalize = (s: string) => s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const contentNorm = normalize(content);
+    const oldStrNorm = normalize(old_str);
+
     // Count occurrences (non-overlapping)
-    const occurrences = content.split(old_str).length - 1;
+    const occurrences = contentNorm.split(oldStrNorm).length - 1;
 
     if (occurrences === 0) {
       return {
@@ -519,7 +528,7 @@ server.registerTool(
 
     // Replace exactly once — use split/join to avoid String.replace() interpreting
     // special patterns like $&, $`, $', $1 in new_str.
-    const newContent = content.split(old_str).join(new_str);
+    const newContent = contentNorm.split(oldStrNorm).join(new_str);
 
     try {
       fs.writeFileSync(filePath, newContent, "utf8");
@@ -566,19 +575,24 @@ server.registerTool(
   async (rawArgs) => {
     const command = (rawArgs as { command: string }).command;
 
+    const TIMEOUT_MS = 120_000; // 2 minutes, matching Claude's bash tool timeout
+
     const result = await new Promise<{ returncode: number; stdout: string; stderr: string }>(
       (resolve) => {
         execFileCallback(
           'bash',
           ['-c', command],
-          { encoding: 'buffer', maxBuffer: 100 * 1024 * 1024, cwd: '/' },
+          { encoding: 'buffer', maxBuffer: 100 * 1024 * 1024, cwd: '/', timeout: TIMEOUT_MS, killSignal: 'SIGTERM' },
           (error: ExecFileException | null, stdoutBuf: Buffer, stderrBuf: Buffer) => {
+            const timedOut = error?.killed === true;
             const returncode =
               error && 'code' in error && typeof error.code === 'number'
                 ? error.code
                 : 0;
             const stdout = stdoutBuf.toString('utf8');
-            const stderr = stderrBuf.toString('utf8');
+            const stderr = timedOut
+              ? `Command timed out after ${TIMEOUT_MS / 1000}s`
+              : stderrBuf.toString('utf8');
             resolve({ returncode, stdout, stderr });
           }
         );
